@@ -71,28 +71,24 @@ local function start()
     local next_slot = 1
 
     for _, reactor in pairs(nuke_manager.settings.reactors) do
-        local t = reactor_manager.start(nuke_manager.settings, nuke_manager.reactor_config, reactor, next_slot, nuke_manager.logger)
+        local state = reactor_manager.start(nuke_manager.settings, nuke_manager.reactor_config, reactor, next_slot, nuke_manager.logger)
 
-        t:detach()
+        state.thread:detach()
 
-        nuke_manager.threads[#nuke_manager.threads + 1] = {
-            t = t,
-            reactor = reactor
-        }
+        nuke_manager.threads[#nuke_manager.threads + 1] = state
 
         next_slot = next_slot + 1
     end
 end
 
 local function stop()
-    for _, t in pairs(nuke_manager.threads) do
-        nuke_manager.logger.info("Stopping reactor " .. t.reactor.reactor_address)
-        event.push("reactor_stop", t.reactor.reactor_address)
+    for _, state in pairs(nuke_manager.threads) do
+        state.stopped = true
     end
 
-    for _, t in pairs(nuke_manager.threads) do
-        nuke_manager.logger.info("Waiting for worker thread to stop for reactor " .. t.reactor.reactor_address)
-        t.t:join()
+    for _, state in pairs(nuke_manager.threads) do
+        nuke_manager.logger.info("Waiting for worker thread to stop for reactor " .. state.reactor.reactor_address)
+        state.thread:join()
     end
 
     threads = {}
@@ -104,22 +100,10 @@ local function run()
     print("Starting nuke_manager in 5 seconds, press Ctrl+C to cancel")
     
     if event.pull(5, "interrupted") then
-        nuke_manager.logger.info("Exiting.")
         return
     end
     
     local state = { running = true }
-    
-    local function interrupt()
-        nuke_manager.logger.info("Interrupted")
-        state.running = false
-    end
-    
-    event.listen("interrupted", interrupt)
-    
-    if not state.running then
-        return
-    end
     
     start()
     
@@ -137,7 +121,11 @@ local function run()
 
             if iface == nil then
                 nuke_manager.logger.warn("Could not find me_interface to check coolant levels")
-                event.push("reactor_pause")
+                
+                for _, state in pairs(nuke_manager.threads) do
+                    state.paused = true
+                end
+
                 goto continue
             end
 
@@ -156,22 +144,33 @@ local function run()
             local has_coolant = coolant > (nuke_manager.settings.cool_coolant_min or 0)
 
             if not has_coolant then
-                nuke_manager.logger.warn("Not enough coolant: needs " .. utils.format_int(nuke_manager.settings.cool_coolant_min or 0) .. " but has " .. utils.format_int(coolant))
+                nuke_manager.logger.warn("not enough coolant: needs " .. utils.format_int(nuke_manager.settings.cool_coolant_min or 0) .. " but has " .. utils.format_int(coolant))
+            else
+                nuke_manager.logger.info("hot coolant: " .. utils.format_int(hot_coolant) .. "    coolant: " .. utils.format_int(coolant))
             end
 
             if has_coolant and needs_hot_coolant then
-                event.push("reactor_continue")
+                for _, state in pairs(nuke_manager.threads) do
+                    state.paused = false
+                end
             else
-                event.push("reactor_pause")
+                for _, state in pairs(nuke_manager.threads) do
+                    state.paused = true
+                end
             end
         end
 
         ::continue::
 
-        os.sleep(5)
+        if event.pull(5, "interrupted") ~= nil then
+            nuke_manager.logger.info("Interrupted")
+            state.running = false
+
+            for _, state in pairs(nuke_manager.threads) do
+                state.stopped = true
+            end
+        end
     end
-    
-    event.ignore("interrupted", interrupt)
     
     stop()
 end
@@ -186,5 +185,4 @@ function catch(fn, logger)
     end
 end
 
--- thread.create(function() catch(run, nuke_manager.logger) end):join()
 run()

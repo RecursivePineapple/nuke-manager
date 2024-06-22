@@ -23,7 +23,7 @@ function reactor_manager.get_reactor_info(reactor)
     end
 
     local width = size // 6
-    local extra = size % 6 
+    local extra = size % 6
 
     if width < 3 or width > 9 then
         error("reactor inventory must have 6 rows and have between 3 to 9 columns (inclusive): this inventory is likely not a reactor (transposer address = " ..
@@ -143,6 +143,10 @@ function reactor_manager.run_once(settings, config, reactor, db_slot, logger)
             end
 
             ::continue::
+
+            if event.pull(0, "interrupted") ~= nil then
+                break
+            end
         end
     end
 
@@ -152,23 +156,64 @@ function reactor_manager.run_once(settings, config, reactor, db_slot, logger)
 end
 
 function reactor_manager.start(settings, config, reactor, db_slot, logger)
-    return thread.create(function()
+    local heat_check_period = 1
+    local status_update_period = 5
+    local inv_check_period = 20
+    local component_warn_period = 30
+
+    local now = os.time() / 72
+
+    local state = {
+        config = config,
+        reactor = reactor,
+        db_slot = db_slot,
+
+        start = now,
+        last_update = now + status_update_period,
+        last_inv_check = now + 5,
+        last_heat_check = 0,
+        last_component_warn = 0,
+
+        paused = false,
+        checking = false,
+        suspended = false,
+        stopped = false,
+        valid = nil,
+        should_be_on = true,
+    }
+
+    state.thread = thread.create(function()
         logger.info("started worker thread for reactor " .. reactor.reactor_address)
 
         local prefix = string.format("[%s] ", string.sub(reactor.reactor_address, 1, 3))
         
-        local state = {
-            start = os.time() / 72,
-            last_update = 0,
-            last_inv_check = 0,
-            last_component_warn = 0,
-            paused = false,
-            checking = false,
-            suspended = false,
-            stopped = false,
-        }
+        local function real_set_active(active)
+            if active == nil then active = false end
 
-        local function do_status_check()
+            if reactor.invert_redstone then
+                active = not active
+            end
+
+            local curr = active and 15 or 0
+
+            local prev = component.proxy(reactor.redstone_io).setOutput(reactor.redstone_side, curr)
+
+            if curr ~= prev then
+                logger.info(prefix .. "redstone: " .. prev .. " -> " .. curr)
+            end
+        end
+
+        local function set_active(active)
+            local success, ret = pcall(real_set_active, active)
+        
+            if not success then
+                logger.error(tostring(ret))
+            else
+                return ret
+            end
+        end
+
+        local function do_heat_check()
             local heat = component.invoke(reactor.reactor_address, "getHeat")
             local maxHeat = component.invoke(reactor.reactor_address, "getMaxHeat")
 
@@ -186,92 +231,57 @@ function reactor_manager.start(settings, config, reactor, db_slot, logger)
                 state.suspended = true
             end
 
-            local should_be_on = true
+            local now = os.time() / 72
+            if now - state.last_update > status_update_period then
+                local status = ""
 
+                if redlined then status = status .. " redlined" end
+                if state.paused or state.checking then status = status .. " paused" end
+                if state.suspended then status = status .. " suspended" end
+                if not (state.paused or state.checking) and state.should_be_on then status = status .. " active" end
+                if state.valid == nil then status = "awaiting inventory check" end
+                if state.valid == false then status = "invalid inventory" end
+                if status == "" then status = "idle" end
+
+                logger.info(prefix .. "reactor status: " .. status .. "   heat: " .. utils.format_int(heat) .. "/" .. utils.format_int(maxHeat))
+                state.last_update = now
+            end
+        end
+
+        local function do_activity_check()
             local now = os.time() / 72
 
             if config.pulsed then
                 local pulse_period = config.onPulse + config.offPulse
                 local within_period = (now - state.start) % pulse_period
 
-                should_be_on = within_period > config.onPulse
-            end
-
-            if now - state.last_update > 5 then
-                local status = ""
-
-                if redlined then status = status .. " redlined" end
-                if state.paused or state.checking then status = status .. " paused" end
-                if state.suspended then status = status .. " suspended" end
-                if not (state.paused or state.checking) and should_be_on then status = status .. " active" end
-                if status == "" then status = "idle" end
-
-                logger.info(prefix .. "reactor status: " .. status .. "   heat: " .. utils.format_int(heat) .. "/" .. utils.format_int(maxHeat))
-                state.last_update = now
+                state.should_be_on = within_period > config.onPulse
             end
 
             local output = false
 
-            if redlined or state.paused or state.checking or state.suspended or state.stopped or not should_be_on then
+            if redlined or state.paused or state.checking or state.suspended or state.stopped or not state.valid or not state.should_be_on then
                 output = false
             else
                 output = true
             end
 
-            if reactor.invert_redstone then
-                output = not output
-            end
-
-            local curr = output and 14 or 0
-
-            local prev = component.proxy(reactor.redstone_io).setOutput(reactor.redstone_side, curr)
-
-            if curr ~= prev then
-                logger.info(prefix .. "redstone: " .. prev .. " -> " .. curr)
-            end
+            set_active(output)
         end
 
         local function do_inv_check()
-            state.checking = true
-
             logger.info(prefix .. "starting reactor inventory check: reactor will be paused")
-
-            do_status_check()
 
             local missing = reactor_manager.run_once(settings, config, reactor, db_slot, logger)
 
             if next(missing) ~= nil then
                 logger.info(prefix .. "reactor will not restart until the following missing items are available: " .. utils.table_to_string_pretty(missing))
+                state.valid = false
             else
                 logger.info(prefix .. "reactor inventory check finished: reactor will resume")
-
-                state.checking = false
+                state.valid = true
             end
         end
-
-        local function pause(evt, addr)
-            if not addr or addr == reactor.reactor_address then
-                state.paused = true
-            end
-        end
-
-        local function continue(evt, addr)
-            if not addr or addr == reactor.reactor_address then
-                state.paused = false
-            end
-        end
-
-        local function stop(evt, addr)
-            if addr == nil or addr == reactor.reactor_address then
-                logger.info(prefix .. "stopping worker thread")
-                state.stopped = true
-            end
-        end
-
-        event.listen("reactor_pause", pause)
-        event.listen("reactor_continue", continue)
-        event.listen("reactor_stop", stop)
-        event.listen("interrupted", stop)
 
         while not state.stopped do
             local now = os.time() / 72
@@ -279,68 +289,73 @@ function reactor_manager.start(settings, config, reactor, db_slot, logger)
             local any_disconnected = false
 
             if component.proxy(reactor.transposer) == nil then
-                if (now - state.last_component_warn) > 10 then
+                if (now - state.last_component_warn) > component_warn_period then
                     logger.warn(prefix .. "transposer " .. reactor.transposer .. " is not connected")
                 end
                 any_disconnected = true
             end
 
             if component.proxy(reactor.reactor_address) == nil then
-                if (now - state.last_component_warn) > 10 then
+                if (now - state.last_component_warn) > component_warn_period then
                     logger.warn(prefix .. "reactor " .. reactor.reactor_address .. " is not connected")
                 end
                 any_disconnected = true
             end
 
             if component.proxy(reactor.interface_address) == nil then
-                if (now - state.last_component_warn) > 10 then
+                if (now - state.last_component_warn) > component_warn_period then
                     logger.warn(prefix .. "me interface " .. reactor.interface_address .. " is not connected")
                 end
                 any_disconnected = true
             end
 
             if component.proxy(reactor.redstone_io) == nil then
-                if (now - state.last_component_warn) > 10 then
+                if (now - state.last_component_warn) > component_warn_period then
                     logger.warn(prefix .. "redstone I/O " .. reactor.redstone_io .. " is not connected")
                 end
                 any_disconnected = true
             end
 
             if any_disconnected then
-                if (now - state.last_component_warn) > 10 then
+                if (now - state.last_component_warn) > component_warn_period then
                     state.last_component_warn = now
                 end
 
-                local redstone = component.proxy(reactor.redstone_io)
-
-                if redstone then
-                    redstone.setOutput(reactor.redstone_side, reactor.invert_redstone and 15 or 0)
-                end
+                set_active(false)
 
                 goto continue
             end
 
-            catch(do_status_check, logger)
+            if now - state.last_heat_check > heat_check_period then
+                catch(do_heat_check, logger)
+                state.last_heat_check = now
+            end
 
-            if now - state.last_inv_check > 20 then
+            if now - state.last_inv_check > inv_check_period then
+                state.checking = true
+            end
+            
+            catch(do_activity_check, logger)
+
+            if now - state.last_inv_check > inv_check_period then
                 catch(do_inv_check, logger)
                 state.last_inv_check = now
+                state.checking = false
             end
             
             ::continue::
 
-            os.sleep(0.5)
+            if event.pull(1, "interrupted") ~= nil then
+                break
+            end
         end
 
-        component.invoke(reactor.redstone_io, "setOutput", reactor.redstone_side, reactor.invert_redstone and 15 or 0)
-
-        event.ignore("reactor_pause", pause)
-        event.ignore("reactor_continue", continue)
-        event.ignore("reactor_stop", stop)
-        event.ignore("interrupted", stop)
+        set_active(false)
 
         logger.info(prefix .. "worker thread stopped")
     end)
+
+    return state
 end
 
 return reactor_manager
