@@ -239,8 +239,8 @@ function reactor_manager.start(settings, config, reactor, db_slot, logger)
                 if state.paused or state.checking then status = status .. " paused" end
                 if state.suspended then status = status .. " suspended" end
                 if not (state.paused or state.checking) and state.should_be_on then status = status .. " active" end
-                if state.valid == nil then status = "awaiting inventory check" end
-                if state.valid == false then status = "invalid inventory" end
+                if state.valid == nil then status = status .. "awaiting inventory check" end
+                if state.valid == false then status = status .. "invalid inventory" end
                 if status == "" then status = "idle" end
 
                 logger.info(prefix .. "reactor status: " .. status .. "   heat: " .. utils.format_int(heat) .. "/" .. utils.format_int(maxHeat))
