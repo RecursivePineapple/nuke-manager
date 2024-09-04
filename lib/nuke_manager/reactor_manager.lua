@@ -84,8 +84,6 @@ function reactor_manager.run_once(settings, config, reactor, db_slot, logger)
     local tpose = component.proxy(reactor.transposer)
     local iface = component.proxy(reactor.interface_address)
 
-    local inv = tpose.getAllStacks(reactor.reactor_side).getAll()
-
     local reactor_width, reactor_type = reactor_manager.get_reactor_info(reactor)
 
     local needed = {}
@@ -99,21 +97,44 @@ function reactor_manager.run_once(settings, config, reactor, db_slot, logger)
 
             local config_slot = config.grid[slot_name]
             local config_item = config_slot and items[config_slot.componentId] or {}
-            local actual_item = inv[slot_index - 1] or {}
+            local slot_info = component.invoke(reactor.reactor_address, "getSlotInfo", col, row) or {}
+            local actual_item = slot_info.item or {}
 
-            if actual_item.name == nil and config_item.item_name == nil then
-                goto continue
+            if actual_item.name == nil then
+                if config_item.item_name == nil then
+                    goto continue
+                else
+                    goto replace_item
+                end
             end
 
             if actual_item.name and actual_item.name ~= config_item.item_name then
-                logger.info(prefix .. "removing invalid item from " .. (row + 1) .. ":" .. (col + 1) .. " called " .. actual_item.label)
-
-                repeat
-                    tpose.transferItem(reactor.reactor_side, reactor.interface_side, 64, slot_index, 2)
-
-                    actual_item = tpose.getStackInSlot(reactor.reactor_side, slot_index) or {}
-                until actual_item.name == nil
+                goto remove_item
             end
+
+            -- Check Item Heat
+            if actual_item and actual_item.name == config_item.item_name and config_slot and config_slot.automationThreshold and slot_info.heat then
+                if not config_slot.extractCold and slot_info.heat >= config_slot.automationThreshold then
+                    goto remove_item
+                elseif config_slot.extractCold and slot_info.heat <= config_slot.automationThreshold then
+                    goto remove_item
+                end
+            end
+
+            goto continue
+
+            ::remove_item::
+
+            logger.info(prefix .. "removing invalid item from " .. (row + 1) .. ":" .. (col + 1) .. " called " .. actual_item.label)
+            
+            repeat
+                tpose.transferItem(reactor.reactor_side, reactor.interface_side, 64, slot_index, 2)
+
+                slot_info = component.invoke(reactor.reactor_address, "getSlotInfo", col, row) or {}
+                actual_item = slot_info.item or {}
+            until actual_item.name == nil
+
+            ::replace_item::
 
             if config_item.item_name and actual_item.name ~= config_item.item_name then
                 local selected = tpose.getStackInSlot(reactor.interface_side, 1) or {}
