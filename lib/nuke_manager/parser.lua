@@ -1,5 +1,6 @@
 
 local base64 = require("nuke_manager.base64")
+local items = require("nuke_manager.items")
 
 local parser = {}
 
@@ -176,7 +177,20 @@ function parser.load_config(code_string)
                     if config.codeRevision == 0 or (config.codeRevision >= 1 and config.automated) then
                         component.automationThreshold = storage:extract(config.maxComponentHeat)
                         component.reactorPause = storage:extract(10000)
+                    else
+                        config_item = items[componentId]
+                        component.automationThreshold = config_item.automationThreshold
                     end
+                else
+                    config_item = items[componentId]
+                    if config_item.automationThreshold then
+                        component.initialHeat = 0
+                        component.automationThreshold = config_item.automationThreshold
+                    end
+                end
+
+                if component.automationThreshold then
+                    component.extractCold = component.initialHeat > component.automationThreshold
                 end
 
                 config.grid[row .. ":" .. col] = component
