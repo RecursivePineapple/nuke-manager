@@ -132,6 +132,8 @@ function reactor_manager.run_once(settings, config, reactor, db_slot, logger)
 
                 slot_info = component.invoke(reactor.reactor_address, "getSlotInfo", col, row) or {}
                 actual_item = slot_info.item or {}
+                -- short sleep because sometimes this loop hangs for some reason
+                os.sleep(0.1)
             until actual_item.name == nil
 
             ::replace_item::
